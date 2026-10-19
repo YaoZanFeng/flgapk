@@ -1,0 +1,123 @@
+name: Build both Liquid Glass demo APKs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: liquid-glass-renderer
+            repository: whynotmake-it/flutter_liquid_glass
+            revision: 46e875dc3a0ebc2fe2cfe66e73d8d2d8f79e384f
+            example: packages/liquid_glass_renderer/example
+            project: liquid_glass_renderer_example
+          - name: liquid-glass-widgets
+            repository: sdegenaar/liquid_glass_widgets
+            revision: 5727752c589ee4319fc168b1114e73269278b792
+            example: example
+            project: liquid_glass_widgets_example
+    env:
+      DEMO_PATH: source/${{ matrix.example }}
+      DEMO_PROJECT: ${{ matrix.project }}
+      APK_NAME: ${{ matrix.name }}
+    steps:
+      - name: Checkout pinned upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.revision }}
+          path: source
+          lfs: true
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Flutter matching renderer .fvmrc
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+          cache: true
+
+      - name: Generate missing Android project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DEMO_PATH"
+          flutter create --platforms=android --org=com.example --project-name="$DEMO_PROJECT" --no-pub .
+          git diff --exit-code -- lib pubspec.yaml
+
+      - name: Enable Impeller and renderer Flutter GPU
+        env:
+          DEMO_KIND: ${{ matrix.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          uri = 'http://schemas.android.com/apk/res/android'
+          ET.register_namespace('android', uri)
+          key = '{' + uri + '}'
+          path = Path(os.environ['DEMO_PATH']) / 'android/app/src/main/AndroidManifest.xml'
+          tree = ET.parse(path)
+          root = tree.getroot()
+          app = root.find('application')
+          if app is None:
+              raise SystemExit('Android manifest has no application')
+          flags = ['io.flutter.embedding.android.EnableImpeller']
+          if os.environ['DEMO_KIND'] == 'liquid-glass-renderer':
+              flags.append('io.flutter.embedding.android.EnableFlutterGPU')
+          for flag in flags:
+              node = next((n for n in app.findall('meta-data') if n.get(key + 'name') == flag), None)
+              if node is None:
+                  node = ET.SubElement(app, 'meta-data')
+              node.set(key + 'name', flag)
+              node.set(key + 'value', 'true')
+          permission = 'android.permission.INTERNET'
+          if not any(n.get(key + 'name') == permission for n in root.findall('uses-permission')):
+              ET.SubElement(root, 'uses-permission', {key + 'name': permission})
+          tree.write(path, encoding='utf-8', xml_declaration=True)
+          PY
+
+      - name: Resolve example dependencies
+        working-directory: ${{ env.DEMO_PATH }}
+        run: flutter pub get
+
+      - name: Build installable universal release APK
+        working-directory: ${{ env.DEMO_PATH }}
+        run: flutter build apk --release
+
+      - name: Collect APK and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp "$DEMO_PATH/build/app/outputs/flutter-apk/app-release.apk" "output/$APK_NAME.apk"
+          cd output
+          sha256sum "$APK_NAME.apk" > "$APK_NAME.apk.sha256"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-apk
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
